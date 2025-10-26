@@ -1,31 +1,30 @@
-// src/app/api/ingest/route.ts
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
 
-// IMPORTANT: Node runtime (Cloudinary/Buffer need Node, not Edge)
 export const runtime = 'nodejs';
 
-// Use relative imports to avoid alias issues
-import { uploadImageToCloudinary } from '../../../lib/upload';
+import { uploadImageToCloudinary, uploadAudioToCloudinary } from '../../../lib/upload';
 import { supabase } from '../../../lib/supabase';
 
-// ---- OPTIONAL LLM step (can comment out initially) ----
 async function structureArtifact(input: { text: string; imageUrls: string[]; transcript?: string }) {
-  const prompt = `You are turning raw notes and images into a concise, elegant catalog entry.
+  const prompt = `You are turning notes and (optional) transcript into a concise, elegant catalog entry.
 
-Return strictly this JSON schema:
+Return strictly this JSON:
 {
   "title": string,
   "summary": string,
   "media": [ {"type":"image","src":string,"alt"?:string} ]
 }
-- Write a human, warm title and a 1–3 sentence summary.`;
 
-  const content = [input.text, input.transcript ?? ''].filter(Boolean).join('\n\n');
+- Use transcript details when helpful.
+- Title human-friendly; summary 1–3 sentences.`;
+  const content = [input.text, input.transcript ? `Transcript:\n${input.transcript}` : '']
+    .filter(Boolean)
+    .join('\n\n');
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       messages: [
@@ -36,10 +35,7 @@ Return strictly this JSON schema:
     })
   });
 
-  if (!resp.ok) {
-    const txt = await resp.text();
-    throw new Error(`OpenAI error: ${txt}`);
-  }
+  if (!resp.ok) throw new Error(`OpenAI error: ${await resp.text()}`);
 
   const data = await resp.json();
   const json = JSON.parse(data.choices?.[0]?.message?.content ?? '{}');
@@ -50,12 +46,9 @@ Return strictly this JSON schema:
     media: z.array(z.object({ type: z.literal('image'), src: z.string().url(), alt: z.string().optional() }))
   }).parse(json);
 
-  // Merge any URLs we uploaded locally
-  const merged = { ...safe, media: [...safe.media, ...input.imageUrls.map(u => ({ type: 'image', src: u }))] };
-  return merged;
+  return { ...safe, media: [...safe.media, ...input.imageUrls.map(u => ({ type: 'image' as const, src: u }))] };
 }
 
-// ---- OPTIONAL Whisper (audio transcription) ----
 async function transcribeAudio(file: File) {
   const form = new FormData();
   form.append('file', file);
@@ -65,87 +58,91 @@ async function transcribeAudio(file: File) {
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
     body: form
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Whisper error: ${t}`);
-  }
+  if (!r.ok) throw new Error(`Whisper error: ${await r.text()}`);
   const j = await r.json();
   return j.text as string;
 }
 
 export async function POST(req: NextRequest) {
   try {
-    // Quick env sanity (don’t log secrets)
-    console.log('Cloudinary cloud:', process.env.CLOUDINARY_CLOUD_NAME || '(missing)');
-
     const formData = await req.formData();
     const images = formData.getAll('images') as File[];
     const audio = formData.get('audio') as File | null;
     const text = String(formData.get('text') || '');
 
-    console.log('Images received:', images.length);
-
-    // Upload images to Cloudinary
-    const uploaded: string[] = [];
-    for (const f of images.slice(0, 5)) {
+    // 1) Upload images
+    const uploadedImages: string[] = [];
+    for (const f of images.slice(0, 8)) {
       try {
         const url = await uploadImageToCloudinary(f);
-        uploaded.push(url);
+        uploadedImages.push(url);
       } catch (e: any) {
-        console.error('Cloudinary upload failed:', e?.message || e);
+        console.error('Image upload failed:', e?.message || e);
       }
     }
-    console.log('Uploaded URLs:', uploaded);
 
-    // OPTIONAL transcription
-    const transcript = audio ? await transcribeAudio(audio) : undefined;
+    // 2) Upload audio (optional)
+    let audioUrl: string | undefined;
+    if (audio) {
+      try {
+        audioUrl = await uploadAudioToCloudinary(audio);
+      } catch (e: any) {
+        console.error('Audio upload failed:', e?.message || e);
+      }
+    }
 
-    // OPTIONAL LLM structuring (can skip initially)
+    // 3) Transcribe audio (optional)
+    let transcript: string | undefined;
+    if (audio) {
+      try {
+        transcript = await transcribeAudio(audio);
+      } catch (e: any) {
+        console.warn('Whisper transcription skipped:', e?.message || e);
+      }
+    }
+
+    // 4) LLM structuring (optional; falls back gracefully)
     let title = text.trim() || 'Untitled Artifact';
     let summary = 'Generated via MVP.';
-    let media = uploaded.map(u => ({ type: 'image' as const, src: u }));
+    let media: { type: 'image' | 'audio'; src: string; alt?: string }[] =
+      uploadedImages.map(u => ({ type: 'image', src: u }));
 
-try {
-  const structured = await structureArtifact({ text, imageUrls: uploaded, transcript });
-
-  if (structured) {
-    title = structured.title ?? title;
-    summary = structured.summary ?? summary;
-
-    if (Array.isArray(structured.media) && structured.media.length > 0) {
-      media = structured.media as typeof media; // ✅ ensures types match
+    try {
+      const structured = await structureArtifact({ text, imageUrls: uploadedImages, transcript });
+      if (structured) {
+        title = structured.title ?? title;
+        summary = structured.summary ?? summary;
+        if (Array.isArray(structured.media) && structured.media.length > 0) {
+          media = structured.media as typeof media;
+        }
+      }
+    } catch (llmErr: any) {
+      console.warn('LLM structuring skipped/fallback:', llmErr?.message ?? llmErr);
     }
-  }
-} catch (llmErr: any) {
-  console.warn(
-    'LLM structuring skipped/fallback:',
-    llmErr?.message ?? llmErr
-  );
-}
 
-    // Slugify title
+    // 5) If we have audio, add it to media so the page shows a player
+    if (audioUrl) {
+      media.push({ type: 'audio', src: audioUrl });
+    }
+
+    // 6) Slug + save
     const slug =
-      title.toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/(^-|-$)/g, '')
-        .slice(0, 60) || `artifact-${Math.random().toString(36).slice(2,8)}`;
+      title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) ||
+      `artifact-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Build and save artifact
     const artifact = {
       id: crypto.randomUUID(),
       title,
       summary,
       media,
+      transcript, // ← saved so you can display it
       tags: [],
       theme: 'museum',
       privacy: 'public'
     };
 
     const { error } = await supabase.from('artifacts').insert({ slug, json: artifact });
-    if (error) {
-      console.error('Supabase insert error:', error.message);
-      return new Response(JSON.stringify({ error: error.message }), { status: 500 });
-    }
+    if (error) return new Response(JSON.stringify({ error: error.message }), { status: 500 });
 
     return new Response(JSON.stringify({ slug }), { status: 200 });
   } catch (err: any) {

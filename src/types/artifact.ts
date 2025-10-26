@@ -1,11 +1,12 @@
 export type Media = { type: 'image' | 'audio' | 'video'; src: string; alt?: string; poster?: string };
 export type Artifact = {
   id: string;
-  type?: string; // car | watch | product | custom
+  type?: string;
   title: string;
   summary: string;
   media: Media[];
-  provenance?: Record<string, any>; // maker, model, year, history[]
+  transcript?: string; // ← NEW
+  provenance?: Record<string, any>;
   tags?: string[];
   theme?: 'museum' | 'journal' | 'gallery';
   privacy?: 'public' | 'private' | 'unlisted';
