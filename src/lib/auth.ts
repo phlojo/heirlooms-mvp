@@ -1,8 +1,8 @@
-import { getSupabaseServer } from "@/lib/supabase/server";
+import { getSupabaseServer } from "@/src/lib/supabase/server";
 
 export async function getUserOrNull() {
   const supabase = getSupabaseServer();
-  const { data: { user } } = await supabase.auth.getUser();
+  const { data: { user } } = await (await supabase).auth.getUser();
   return user ?? null;
 }
 
