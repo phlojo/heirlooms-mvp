@@ -1,13 +1,36 @@
-import { NextRequest } from 'next/server';
-import { z } from 'zod';
+// src/app/api/ingest/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 
-export const runtime = 'nodejs';
+// Imports (switch to relative if you don't have the "@/src" alias)
+import { getSupabaseServer } from "@/src/lib/supabase/server";
+import { uploadImageToCloudinary, uploadAudioToCloudinary } from "@/src/lib/upload";
 
-import { uploadImageToCloudinary, uploadAudioToCloudinary } from '../../../lib/upload';
-import { supabase } from '../../../lib/supabase';
+export const runtime = "nodejs";
 
-async function structureArtifact(input: { text: string; imageUrls: string[]; transcript?: string }) {
-  const prompt = `You are turning notes and (optional) transcript into a concise, elegant catalog entry.
+// ----- Local types -----
+type MediaItem = { type: "image" | "audio"; src: string; alt?: string };
+
+// ----- Helpers -----
+async function structureArtifact(input: {
+  text: string;
+  imageUrls: string[];
+  transcript?: string;
+}) {
+  const fallback = {
+    title: input.text?.trim()
+      ? input.text.trim().slice(0, 60)
+      : (input.transcript?.trim()?.slice(0, 60) || "Untitled Artifact"),
+    summary: input.transcript
+      ? "Generated from notes and audio transcript."
+      : "Generated from notes.",
+    media: input.imageUrls.map((u) => ({ type: "image", src: u } as MediaItem)),
+  };
+
+  if (!process.env.OPENAI_API_KEY) return fallback;
+
+  try {
+    const prompt = `You are turning notes and (optional) transcript into a concise, elegant catalog entry.
 
 Return strictly this JSON:
 {
@@ -16,137 +39,214 @@ Return strictly this JSON:
   "media": [ {"type":"image","src":string,"alt"?:string} ]
 }
 
-- Use transcript details when helpful.
-- Title human-friendly; summary 1–3 sentences.`;
-  const content = [input.text, input.transcript ? `Transcript:\n${input.transcript}` : '']
-    .filter(Boolean)
-    .join('\n\n');
+Guidelines:
+- Title: 3–7 words, proper case.
+- Summary: 1–3 punchy sentences, no fluff.
+- Media: reference given image URLs with short alt text.
+- If transcript is present, use it to improve summary.
 
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: prompt },
-        { role: 'user', content }
-      ],
-      response_format: { type: 'json_object' }
-    })
-  });
+NOTES:
+${input.text || "(none)"}
 
-  if (!resp.ok) throw new Error(`OpenAI error: ${await resp.text()}`);
+TRANSCRIPT:
+${input.transcript || "(none)"}
 
-  const data = await resp.json();
-  const json = JSON.parse(data.choices?.[0]?.message?.content ?? '{}');
+IMAGE_URLS:
+${input.imageUrls.join("\n")}
+`;
 
-  const safe = z.object({
-    title: z.string().min(1),
-    summary: z.string().min(1),
-    media: z.array(z.object({ type: z.literal('image'), src: z.string().url(), alt: z.string().optional() }))
-  }).parse(json);
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "Return ONLY valid JSON. Do not include backticks." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.2,
+      }),
+    });
 
-  return { ...safe, media: [...safe.media, ...input.imageUrls.map(u => ({ type: 'image' as const, src: u }))] };
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    const txt = j?.choices?.[0]?.message?.content;
+    if (!txt || typeof txt !== "string") throw new Error("No JSON returned");
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(txt);
+    } catch {
+      const match = txt.match(/\{[\s\S]*\}$/);
+      parsed = match ? JSON.parse(match[0]) : null;
+    }
+    if (!parsed) throw new Error("Invalid JSON from model");
+
+    const Shape = z.object({
+      title: z.string().min(1),
+      summary: z.string().min(1),
+      media: z.array(
+        z.object({
+          type: z.literal("image"),
+          src: z.string().url(),
+          alt: z.string().optional(),
+        })
+      ),
+    });
+
+    const safe = Shape.parse(parsed);
+
+    // Ensure all supplied images appear at least once
+    const existing = new Set(safe.media.map((m) => m.src));
+    const additions = input.imageUrls
+      .filter((u) => !existing.has(u))
+      .map((u) => ({ type: "image" as const, src: u }));
+    return { ...safe, media: [...safe.media, ...additions] };
+  } catch (err) {
+    console.warn("LLM structuring failed; using fallback:", err);
+    return fallback;
+  }
 }
 
 async function transcribeAudio(file: File) {
-  const form = new FormData();
-  form.append('file', file);
-  form.append('model', 'whisper-1');
-  const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: form
-  });
-  if (!r.ok) throw new Error(`Whisper error: ${await r.text()}`);
-  const j = await r.json();
-  return j.text as string;
+  if (!process.env.OPENAI_API_KEY) return undefined;
+
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("model", process.env.OPENAI_WHISPER_MODEL || "whisper-1");
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    return j.text as string;
+  } catch (err) {
+    console.warn("Whisper transcription failed (non-fatal):", err);
+    return undefined;
+  }
 }
 
+function toSlug(s: string) {
+  const base =
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/(^-|-$)/g, "")
+      .slice(0, 60) || `artifact-${Math.random().toString(36).slice(2, 8)}`;
+  return base;
+}
+
+// ----- Route -----
 export async function POST(req: NextRequest) {
   try {
+    // Auth: require a logged-in user because artifacts.owner_id is NOT NULL
+    const supabase = await getSupabaseServer();
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+
+    if (userErr || !user) {
+      return NextResponse.json(
+        { error: "Unauthorized. Please sign in to create artifacts." },
+        { status: 401 }
+      );
+    }
+
     const formData = await req.formData();
-    const images = formData.getAll('images') as File[];
-    const audio = formData.get('audio') as File | null;
-    const text = String(formData.get('text') || '');
+    const text = String(formData.get("text") || "");
+    const collectionId = String(formData.get("collectionId") || "").trim() || null;
+    const images = formData.getAll("images") as File[];
+    const audio = (formData.get("audio") as File) || null;
 
     // 1) Upload images
     const uploadedImages: string[] = [];
-    for (const f of images.slice(0, 8)) {
-      try {
-        const url = await uploadImageToCloudinary(f);
-        uploadedImages.push(url);
-      } catch (e: any) {
-        console.error('Image upload failed:', e?.message || e);
-      }
+    for (const img of images) {
+      const url = await uploadImageToCloudinary(img);
+      uploadedImages.push(url);
     }
 
-    // 2) Upload audio (optional)
-    let audioUrl: string | undefined;
-    if (audio) {
-      try {
-        audioUrl = await uploadAudioToCloudinary(audio);
-      } catch (e: any) {
-        console.error('Audio upload failed:', e?.message || e);
-      }
-    }
-
-    // 3) Transcribe audio (optional)
+    // 2) Upload audio (+ transcript)
+    let audioUrl: string | null = null;
     let transcript: string | undefined;
     if (audio) {
-      try {
-        transcript = await transcribeAudio(audio);
-      } catch (e: any) {
-        console.warn('Whisper transcription skipped:', e?.message || e);
-      }
+      audioUrl = await uploadAudioToCloudinary(audio);
+      transcript = await transcribeAudio(audio);
     }
 
-    // 4) LLM structuring (optional; falls back gracefully)
-    let title = text.trim() || 'Untitled Artifact';
-    let summary = 'Generated via MVP.';
-    let media: { type: 'image' | 'audio'; src: string; alt?: string }[] =
-      uploadedImages.map(u => ({ type: 'image', src: u }));
+    // 3) Structure
+    const structured = await structureArtifact({
+      text,
+      imageUrls: uploadedImages,
+      transcript,
+    });
 
-    try {
-      const structured = await structureArtifact({ text, imageUrls: uploadedImages, transcript });
-      if (structured) {
-        title = structured.title ?? title;
-        summary = structured.summary ?? summary;
-        if (Array.isArray(structured.media) && structured.media.length > 0) {
-          media = structured.media as typeof media;
-        }
-      }
-    } catch (llmErr: any) {
-      console.warn('LLM structuring skipped/fallback:', llmErr?.message ?? llmErr);
-    }
+    const title = structured.title || "Untitled Artifact";
+    const summary = structured.summary || "Generated by MVP.";
+    const media: MediaItem[] = [
+      ...structured.media,
+      ...(audioUrl ? [{ type: "audio" as const, src: audioUrl }] : []),
+    ];
 
-    // 5) If we have audio, add it to media so the page shows a player
-    if (audioUrl) {
-      media.push({ type: 'audio', src: audioUrl });
-    }
-
-    // 6) Slug + save
-    const slug =
-      title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 60) ||
-      `artifact-${Math.random().toString(36).slice(2, 8)}`;
-
-    const artifact = {
+    // 4) Build record payload
+    const slug = toSlug(title);
+    const dataPayload = {
       id: crypto.randomUUID(),
       title,
       summary,
       media,
-      transcript, // ← saved so you can display it
+      transcript,
       tags: [],
-      theme: 'museum',
-      privacy: 'public'
+      theme: "museum",
+      privacy: "public",
+      collection_id: collectionId, // also inside JSON
+      owner_id: user.id,           // also inside JSON
+      created_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase.from('artifacts').insert({ slug, json: artifact });
-    if (error) return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+    // 5) Insert with graceful fallbacks if some columns don't exist
+    const fullRow: Record<string, any> = {
+      slug,
+      data: dataPayload,
+      title,
+      summary,
+      owner_id: user.id,
+      collection_id: collectionId,
+    };
 
-    return new Response(JSON.stringify({ slug }), { status: 200 });
+    async function tryInsert(row: Record<string, any>) {
+      const { error } = await supabase.from("artifacts").insert(row);
+      return error;
+    }
+
+    // Attempt 1: All columns
+    let err = await tryInsert(fullRow);
+
+    // If a column doesn't exist (42703), strip progressively
+    if (err?.code === "42703") {
+      const { collection_id, ...noCollection } = fullRow;
+      err = await tryInsert(noCollection);
+    }
+    if (err?.code === "42703") {
+      const { title: _t, summary: _s, ...noTitleSummary } = fullRow;
+      err = await tryInsert(noTitleSummary);
+    }
+
+    // Surface any remaining error (e.g., other NOT NULL constraints)
+    if (err) {
+      return NextResponse.json({ error: err.message }, { status: 500 });
+    }
+
+    return NextResponse.json({ slug }, { status: 200 });
   } catch (err: any) {
-    console.error('INGEST ERROR:', err);
-    return new Response(JSON.stringify({ error: String(err?.message || err) }), { status: 500 });
+    console.error("INGEST ERROR:", err);
+    return NextResponse.json({ error: err?.message || String(err) }, { status: 500 });
   }
 }
