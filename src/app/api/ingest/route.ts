@@ -159,8 +159,35 @@ export async function POST(req: NextRequest) {
       String(formData.get("collectionId") || formData.get("collection_id") || "")
         .trim() || null;
 
-    // Only accept valid UUIDs for the top-level column. (JSON can keep whatever string.)
-    const collectionId = colParam && uuidRegex.test(colParam) ? colParam : null;
+    // Debug logging to help trace incoming values during development
+    console.log("INGEST: received colParam:", colParam);
+
+    // Only accept valid UUIDs for the top-level column by default. If the client
+    // supplied a slug (or other string), try to resolve it to a UUID below.
+    let collectionId: string | null = colParam && uuidRegex.test(colParam) ? colParam : null;
+    let ingestWarning: string | null = null;
+
+    // If we got a non-UUID colParam, attempt to resolve it as a collection slug.
+    if (!collectionId && colParam) {
+      try {
+        const { data: found, error: findErr } = await supabase
+          .from("collections")
+          .select("id")
+          .eq("slug", colParam)
+          .limit(1);
+
+        if (!findErr && Array.isArray(found) && found.length > 0) {
+          // found[0] shape: { id: string }
+          collectionId = (found[0] as any).id;
+          console.log("INGEST: resolved slug to collectionId:", collectionId);
+        } else {
+          ingestWarning = `collectionId provided but not a UUID and no collection found for slug '${colParam}'`;
+          console.log("INGEST: could not resolve collection slug:", colParam, "error:", findErr);
+        }
+      } catch (err) {
+        console.warn("INGEST: slug->id resolution failed:", err);
+      }
+    }
 
     const images = formData.getAll("images") as File[];
     const audio = (formData.get("audio") as File) || null;
