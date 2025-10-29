@@ -1,20 +1,25 @@
 // src/app/artifacts/new/page.tsx
-import Link from "next/link";
 import NewArtifactForm from "./NewArtifactForm";
 
 type PageProps = {
-  searchParams?: { [key: string]: string | string[] | undefined };
+  searchParams?: Record<string, string | string[] | undefined>;
 };
 
 export const dynamic = "force-dynamic";
 
+function firstNonEmpty(searchParams: PageProps["searchParams"], keys: string[]) {
+  for (const k of keys) {
+    const v = searchParams?.[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 export default function NewArtifactPage({ searchParams }: PageProps) {
-  const collectionId =
-    typeof searchParams?.collectionId === "string"
-      ? searchParams.collectionId
-      : typeof searchParams?.collection_id === "string"
-      ? searchParams.collection_id
-      : null;
+  // Accept any of these (uuid or slug): collectionId, collection_id, id, collection
+  const initialCollectionId =
+    firstNonEmpty(searchParams, ["collectionId", "collection_id", "id", "collection"]) ||
+    null;
 
   return (
     <main className="max-w-3xl mx-auto p-6 space-y-6">
@@ -23,23 +28,9 @@ export default function NewArtifactPage({ searchParams }: PageProps) {
         <p className="text-sm text-gray-600">
           Add images, optional audio, and notes. We’ll generate a concise title and summary.
         </p>
-
-        <div className="flex items-center gap-3">
-          <Link href="/collections" className="text-sm underline">
-            All Collections
-          </Link>
-          {collectionId && (
-            <Link
-              href={`/collections/${encodeURIComponent(collectionId)}`}
-              className="text-sm underline"
-            >
-              Back to Collection
-            </Link>
-          )}
-        </div>
       </div>
 
-      <NewArtifactForm initialCollectionId={collectionId} />
+      <NewArtifactForm initialCollectionId={initialCollectionId} />
     </main>
   );
 }

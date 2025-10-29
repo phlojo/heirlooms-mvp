@@ -1,264 +1,188 @@
 // src/app/api/ingest/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
 import { getSupabaseServer } from "@/src/lib/supabase/server";
-import { uploadImageToCloudinary, uploadAudioToCloudinary } from "@/src/lib/upload";
+import {
+  uploadImageToCloudinary,
+  uploadAudioToCloudinary,
+} from "@/src/lib/upload";
 
 export const runtime = "nodejs";
 
+// ---------- Types ----------
 type MediaItem = { type: "image" | "audio"; src: string; alt?: string };
+
+// Some projects return a string, some return { secure_url }, some return { url },
+// and some nest inside .data. Handle them all safely.
+type UnknownUploadResult =
+  | string
+  | null
+  | undefined
+  | {
+      secure_url?: string;
+      url?: string;
+      data?: { secure_url?: string; url?: string };
+      [k: string]: any;
+    };
 
 const uuidRegex =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-async function structureArtifact(input: {
-  text: string;
-  imageUrls: string[];
-  transcript?: string;
-}) {
-  const prompt = `
-You are an assistant that structures "artifact" content for a family-archive app.
-Return ONLY JSON with this shape:
-
-{
-  "title": "string (<=80 chars)",
-  "summary": "string (1-2 short sentences)",
-  "media": [{"type":"image","src":"<url>","alt":"optional"}...]
+// ---------- Helpers ----------
+function toSlug(input: string) {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "")
+    .slice(0, 80);
 }
 
-Rules:
-- Keep the title succinct and human.
-- Include each provided image URL exactly once in "media" with type "image".
-- Do not invent media that wasn't provided.
-- Do not include backticks.
+function extractUrl(result: UnknownUploadResult): string | null {
+  if (!result) return null;
+  if (typeof result === "string") return result || null;
 
-NOTES:
-${input.text || "(none)"}
+  // Common Cloudinary SDK shapes
+  if (typeof result.secure_url === "string" && result.secure_url) return result.secure_url;
+  if (typeof result.url === "string" && result.url) return result.url;
 
-TRANSCRIPT:
-${input.transcript || "(none)"}
-
-IMAGE_URLS:
-${input.imageUrls.join("\n")}
-`;
-
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "Return ONLY valid JSON. Do not include backticks." },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.2,
-    }),
-  });
-
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
-  const txt = j?.choices?.[0]?.message?.content;
-  if (!txt || typeof txt !== "string") throw new Error("No JSON returned");
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(txt);
-  } catch {
-    const match = txt.match(/\{[\s\S]*\}$/);
-    parsed = match ? JSON.parse(match[0]) : null;
+  // Some wrappers put the response under .data
+  const data = (result as any).data;
+  if (data) {
+    if (typeof data.secure_url === "string" && data.secure_url) return data.secure_url;
+    if (typeof data.url === "string" && data.url) return data.url;
   }
 
-  const Shape = z.object({
-    title: z.string().min(1).max(120),
-    summary: z.string().min(1),
-    media: z.array(
-      z.object({
-        type: z.literal("image"),
-        src: z.string().url(),
-        alt: z.string().optional(),
-      })
-    ),
-  });
+  // Try a couple of obvious fallbacks if the SDK shape changes
+  if (typeof (result as any).secureUrl === "string") return (result as any).secureUrl;
+  if (typeof (result as any).href === "string") return (result as any).href;
 
-  const safe = Shape.parse(parsed);
-
-  // Ensure all supplied images appear at least once
-  const existing = new Set(safe.media.map((m) => m.src));
-  const additions = input.imageUrls
-    .filter((u) => !existing.has(u))
-    .map((u) => ({ type: "image" as const, src: u }));
-
-  return { ...safe, media: [...safe.media, ...additions] };
+  return null;
 }
 
-async function transcribeAudio(file: File): Promise<string | undefined> {
-  try {
-    const form = new FormData();
-    form.append("model", "whisper-1");
-    form.append("file", file as any);
-    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form,
-    });
-    if (!r.ok) throw new Error(await r.text());
-    const j = await r.json();
-    return j.text as string;
-  } catch (err) {
-    console.warn("Whisper transcription failed (non-fatal):", err);
-    return undefined;
-  }
+// Extract text or query/form fields
+function getFieldFrom(fd: FormData | null, qp: URLSearchParams, key: string): string | null {
+  const vForm = fd?.get(key);
+  if (typeof vForm === "string" && vForm.trim()) return vForm.trim();
+  const vQuery = qp.get(key);
+  if (typeof vQuery === "string" && vQuery.trim()) return vQuery.trim();
+  return null;
 }
 
-function toSlug(s: string) {
-  const base =
-    s
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "")
-      .slice(0, 60) || `artifact-${Math.random().toString(36).slice(2, 8)}`;
-  return base;
-}
-
+// ---------- Handler ----------
 export async function POST(req: NextRequest) {
   try {
     const supabase = await getSupabaseServer();
-    const { data: authData, error: userErr } = await supabase.auth.getUser();
-    const user = authData?.user;
+    const { data: userData } = await supabase.auth.getUser();
+    const user = userData.user;
+    if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-    if (userErr || !user) {
-      return NextResponse.json(
-        { error: "Not authenticated" },
-        { status: 401 }
-      );
-    }
-
-    // Accept data from form-data, JSON, or query
-    const contentType = req.headers.get("content-type") || "";
-    let formData: FormData | null = null;
-    let jsonBody: any = null;
-
-    if (contentType.includes("multipart/form-data")) {
-      formData = await req.formData();
-    } else if (contentType.includes("application/json")) {
-      jsonBody = await req.json().catch(() => null);
-    }
+    const ctype = req.headers.get("content-type") || "";
+    const isMultipart = ctype.includes("multipart/form-data");
+    const formData = isMultipart ? await req.formData() : null;
 
     const url = new URL(req.url);
+    const qp = url.searchParams;
 
-    // Normalize inputs
-    const getNorm = (k: string): string | null => {
-      const vForm = formData?.get(k);
-      if (typeof vForm === "string" && vForm.trim()) return vForm.trim();
-      const vJson = jsonBody?.[k];
-      if (typeof vJson === "string" && vJson.trim()) return vJson.trim();
-      const vQuery = url.searchParams.get(k);
-      if (typeof vQuery === "string" && vQuery.trim()) return vQuery.trim();
-      return null;
-    };
-
-    const text = getNorm("text") || "";
+    const text = getFieldFrom(formData, qp, "text") || "";
     const colParam =
-      getNorm("collectionId") ||
-      getNorm("collection_id") ||
-      getNorm("collection") ||
-      null;
+      getFieldFrom(formData, qp, "collectionId") ||
+      getFieldFrom(formData, qp, "collection_id") ||
+      getFieldFrom(formData, qp, "collection");
 
-    console.log("INGEST: received colParam:", colParam);
+    // ---- Upload media (robust to different upload return shapes)
+    const media: MediaItem[] = [];
 
-    // Accept only UUIDs directly; if not UUID, attempt slug → id resolution
-    let collectionId: string | null = colParam && uuidRegex.test(colParam) ? colParam : null;
-    let ingestWarning: string | null = null;
+    if (isMultipart) {
+      // Images
+      const imgFiles = formData!.getAll("images").filter((v) => v instanceof File) as File[];
+      for (const f of imgFiles) {
+        const res = await uploadImageToCloudinary(f);
+        const url = extractUrl(res);
+        if (url) media.push({ type: "image", src: url });
+      }
 
-    if (!collectionId && colParam) {
-      try {
-        const { data: found, error: findErr } = await supabase
-          .from("collections")
-          .select("id")
-          .eq("slug", colParam)
-          .limit(1);
-
-        if (!findErr && Array.isArray(found) && found.length > 0) {
-          collectionId = (found[0] as any).id as string;
-          console.log("INGEST: resolved slug to collectionId:", collectionId);
-        } else {
-          ingestWarning = `collectionId provided but not a UUID and no collection found for slug '${colParam}'`;
-          console.log("INGEST: could not resolve collection slug:", colParam, "error:", findErr);
-        }
-      } catch (err) {
-        console.warn("INGEST: slug->id resolution failed:", err);
+      // Audio
+      const audioFile = formData!.get("audio");
+      if (audioFile instanceof File) {
+        const res = await uploadAudioToCloudinary(audioFile);
+        const url = extractUrl(res);
+        if (url) media.push({ type: "audio", src: url });
       }
     }
 
-    // Files
-    const images: File[] = formData ? (formData.getAll("images") as File[]) : [];
-    const audio: File | null = formData ? ((formData.get("audio") as File) || null) : null;
+    // ---- Resolve collection (accept uuid or slug)
+    let collectionId: string | null = colParam && uuidRegex.test(colParam) ? colParam : null;
 
-    // Upload images
-    const uploadedImages: string[] = [];
-    for (const img of images) {
-      const url = await uploadImageToCloudinary(img);
-      uploadedImages.push(url);
+    if (!collectionId && colParam) {
+      const { data: found, error: findErr } = await supabase
+        .from("collections")
+        .select("id")
+        .or(`slug.eq.${colParam},id.eq.${colParam}`)
+        .limit(1)
+        .maybeSingle();
+      if (!findErr && found?.id) collectionId = found.id;
     }
 
-    // Upload audio + transcribe if present
-    let audioUrl: string | undefined;
-    let transcript: string | undefined;
-    if (audio) {
-      audioUrl = await uploadAudioToCloudinary(audio);
-      transcript = await transcribeAudio(audio);
+    // Hard-require a valid collection to ensure top-level collection_id gets set
+    if (!collectionId) {
+      return NextResponse.json(
+        { error: "A valid collectionId or slug is required." },
+        { status: 400 }
+      );
     }
 
-    // Structure with LLM
-    const structured = await structureArtifact({
-      text,
-      imageUrls: uploadedImages,
-      transcript,
-    });
+    // ---- Build artifact fields
+    const title =
+      text?.trim()
+        ? text.trim().slice(0, 80)
+        : media.find((m) => m.type === "image")
+        ? "Photograph"
+        : "Artifact";
 
-    const title = structured.title || "Untitled Artifact";
-    const summary = structured.summary || "Generated by MVP.";
-    const media: MediaItem[] = [
-      ...structured.media,
-      ...(audioUrl ? [{ type: "audio" as const, src: audioUrl }] : []),
-    ];
-    const slug = toSlug(title);
+    const summary = text?.trim()
+      ? text.trim().slice(0, 160)
+      : "Imported via uploader.";
 
-    // IMPORTANT: mirror collection both at top-level and inside JSON
-    const dataPayload = {
+    const imageUrls = media.filter((m) => m.type === "image").map((m) => m.src);
+
+    const dataPayload: Record<string, any> = {
       title,
       summary,
       media,
-      transcript,
       tags: [],
       theme: "museum",
       privacy: "public",
       created_at: new Date().toISOString(),
-      ...(collectionId ? { collection_id: collectionId } : {}),
+      collection_id: collectionId, // JSON mirror (useful if column write is blocked)
+      ...(imageUrls.length ? { image_urls: imageUrls } : {}),
     };
 
-    // Try insert with top-level collection_id too
-    const baseRow: Record<string, any> = {
+    const slug = toSlug(title);
+    const row = {
       slug,
       data: dataPayload,
       title,
       summary,
       owner_id: user.id,
-      ...(collectionId ? { collection_id: collectionId } : {}),
+      collection_id: collectionId, // top-level column
     };
 
-    let { data: inserted, error: insertErr } = await supabase
-      .from("artifacts")
-      .insert(baseRow)
-      .select("id, slug, collection_id")
-      .single();
+    // ---- Insert
+    let inserted: any;
+    let insertErr: any;
 
-    // If column missing (42703), retry without top-level and rely on JSON mirror
+    {
+      const { data, error } = await supabase
+        .from("artifacts")
+        .insert(row)
+        .select("id, slug, collection_id")
+        .single();
+      inserted = data;
+      insertErr = error;
+    }
+
+    // If column is missing (42703), retry without top-level (JSON still has it)
     if (insertErr?.code === "42703") {
-      const { data: inserted2, error: insertErr2 } = await supabase
+      const { data: data2, error: err2 } = await supabase
         .from("artifacts")
         .insert({
           slug,
@@ -267,56 +191,30 @@ export async function POST(req: NextRequest) {
           summary,
           owner_id: user.id,
         })
-        .select("id, slug")
+        .select("id, slug, collection_id")
         .single();
-
-      if (insertErr2) {
-        return NextResponse.json({ error: insertErr2.message }, { status: 500 });
-      }
-      // Ensure shape for the rest of the handler
-      inserted = { ...inserted2!, collection_id: null } as any;
-      insertErr = null;
+      inserted = data2;
+      insertErr = err2;
     }
 
     if (insertErr) {
       return NextResponse.json({ error: insertErr.message }, { status: 500 });
     }
 
-    // If insert returned without collection_id but we resolved one, patch it
-    let finalCollectionId = inserted!.collection_id ?? null;
-    if (collectionId && !finalCollectionId) {
-      try {
-        const { data: updated, error: updErr } = await supabase
-          .from("artifacts")
-          .update({ collection_id: collectionId })
-          .eq("id", inserted!.id)
-          .select("collection_id")
-          .single();
-
-        if (!updErr && updated) {
-          finalCollectionId = updated.collection_id ?? finalCollectionId;
-          console.log("INGEST: patched artifact with collection_id:", finalCollectionId);
-        } else {
-          console.warn("INGEST: failed to patch collection_id; error:", updErr);
-          ingestWarning = ingestWarning || `inserted but failed to patch collection_id: ${updErr?.message || updErr}`;
-        }
-      } catch (err) {
-        console.warn("INGEST: exception patching collection_id:", err);
-        ingestWarning = ingestWarning || `inserted but failed to patch collection_id (exception).`;
-      }
+    // Best-effort patch in case top-level came back null (RLS/column write)
+    if (!inserted.collection_id) {
+      await supabase.from("artifacts").update({ collection_id: collectionId }).eq("id", inserted.id);
     }
 
-    const respBody: Record<string, any> = {
-      id: inserted!.id,
-      slug: inserted!.slug,
-      collection_id: finalCollectionId ?? collectionId ?? null,
-      received_collection_param: colParam,
-    };
-    if (ingestWarning) respBody.warning = ingestWarning;
-
-    return NextResponse.json(respBody, { status: 200 });
+    return NextResponse.json(
+      {
+        id: inserted.id,
+        slug: inserted.slug,
+        collection_id: inserted.collection_id ?? collectionId,
+      },
+      { status: 200 }
+    );
   } catch (err: any) {
-    console.error("INGEST ERROR:", err);
-    return NextResponse.json({ error: err?.message || String(err) }, { status: 500 });
+    return NextResponse.json({ error: err?.message || "Server error" }, { status: 500 });
   }
 }

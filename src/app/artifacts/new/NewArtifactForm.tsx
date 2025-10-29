@@ -11,15 +11,13 @@ type Props = {
 export default function NewArtifactForm({ initialCollectionId }: Props) {
   const router = useRouter();
 
-  // form state
   const [text, setText] = useState("");
   const [images, setImages] = useState<File[]>([]);
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
-
-  // recorder support
+  // Recording support
   const [recSupported, setRecSupported] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -33,169 +31,173 @@ export default function NewArtifactForm({ initialCollectionId }: Props) {
   }, []);
 
   function onImagesChange(e: React.ChangeEvent<HTMLInputElement>) {
-    if (e.target.files) {
-      setImages(Array.from(e.target.files));
+    if (e.target.files && e.target.files.length) {
+      setImages((prev) => [...prev, ...Array.from(e.target.files!)]);
+      e.currentTarget.value = "";
     }
   }
 
-  async function startRecording() {
+  function removeImage(i: number) {
+    setImages((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
+  async function startRec() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setRecStream(stream);
-
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      chunksRef.current = [];
-      mr.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) chunksRef.current.push(ev.data);
-      };
-      mr.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        const file = new File([blob], `recording-${Date.now()}.webm`, {
-          type: "audio/webm",
-        });
-        setAudioFile(file);
-        stream.getTracks().forEach((t) => t.stop());
-        setRecStream(null);
-      };
+      const mr = new MediaRecorder(stream);
       mediaRecorderRef.current = mr;
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => chunksRef.current.push(e.data);
+      mr.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        const file = new File([blob], `recording-${Date.now()}.webm`, { type: "audio/webm" });
+        setAudioFile(file);
+      };
       mr.start();
-
       setIsRecording(true);
       setRecordTime(0);
-      timerRef.current = window.setInterval(() => {
-        setRecordTime((t) => t + 1);
-      }, 1000) as unknown as number;
-    } catch (err: any) {
-      console.warn("Recorder failed:", err);
+      timerRef.current = window.setInterval(() => setRecordTime((s) => s + 1), 1000);
+    } catch (e: any) {
+      setError(e?.message || "Microphone permission denied");
     }
   }
 
-  function stopRecording() {
-    try {
-      mediaRecorderRef.current?.stop();
-    } finally {
-      setIsRecording(false);
-      if (timerRef.current) window.clearInterval(timerRef.current);
+  function stopRec() {
+    mediaRecorderRef.current?.stop();
+    recStream?.getTracks().forEach((t) => t.stop());
+    setRecStream(null);
+    setIsRecording(false);
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
       timerRef.current = null;
     }
   }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setMsg(null);
-    setBusy(true);
+    setPending(true);
+    setError(null);
 
     try {
       const fd = new FormData();
       if (initialCollectionId) {
-        // send a couple of key names for robustness
+        // Send multiple aliases so API can resolve uuid-or-slug robustly
         fd.append("collectionId", initialCollectionId);
         fd.append("collection_id", initialCollectionId);
+        fd.append("collection", initialCollectionId);
       }
       if (text.trim()) fd.append("text", text.trim());
       images.forEach((img) => fd.append("images", img));
       if (audioFile) fd.append("audio", audioFile);
 
-      const r = await fetch("/api/ingest", {
-        method: "POST",
-        body: fd,
-      });
-
+      const r = await fetch("/api/ingest", { method: "POST", body: fd });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        throw new Error(j?.error || "Failed to create artifact");
-      }
+      if (!r.ok) throw new Error(j?.error || "Failed to create artifact");
 
       const slug = j?.slug as string | undefined;
       const id = j?.id as string | undefined;
 
       if (slug) router.push(`/artifacts/${encodeURIComponent(slug)}`);
       else if (id) router.push(`/artifacts/${encodeURIComponent(id)}`);
-      else router.push("/collections");
+      else if (initialCollectionId)
+        router.push(`/collections/${encodeURIComponent(initialCollectionId)}`);
+      else router.push("/collections/mine");
     } catch (err: any) {
-      setMsg(`❌ ${err?.message || String(err)}`);
+      setError(err?.message || "Something went wrong");
     } finally {
-      setBusy(false);
+      setPending(false);
     }
   }
 
   return (
-    <form className="space-y-6" onSubmit={onSubmit}>
-      {initialCollectionId && (
+    <form onSubmit={onSubmit} className="space-y-6">
+      {initialCollectionId ? (
         <>
           <input type="hidden" name="collectionId" value={initialCollectionId} />
           <input type="hidden" name="collection_id" value={initialCollectionId} />
+          <input type="hidden" name="collection" value={initialCollectionId} />
           <div className="text-xs text-gray-600">
             Adding to collection: <span className="font-mono">{initialCollectionId}</span>
           </div>
         </>
-      )}
+      ) : null}
 
       <div className="space-y-2">
         <label className="block text-sm font-medium">Notes</label>
         <textarea
+          className="w-full rounded-lg border p-3"
+          rows={5}
+          placeholder="Add context, names, dates, provenance..."
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Add any notes, context, or a short story…"
-          className="w-full rounded-xl border px-3 py-2 min-h-[120px]"
         />
       </div>
 
       <div className="space-y-2">
         <label className="block text-sm font-medium">Images</label>
-        <input type="file" name="images" accept="image/*" multiple onChange={onImagesChange} />
-        <p className="text-xs text-gray-500">You can select multiple images.</p>
+        <input type="file" accept="image/*" multiple onChange={onImagesChange} />
+        {images.length ? (
+          <ul className="mt-2 grid grid-cols-3 gap-2">
+            {images.map((f, i) => (
+              <li key={i} className="relative rounded-lg border p-2">
+                <div className="text-xs break-all">{f.name}</div>
+                <button
+                  type="button"
+                  className="absolute right-1 top-1 text-xs underline"
+                  onClick={() => removeImage(i)}
+                >
+                  remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
       </div>
 
       <div className="space-y-2">
         <label className="block text-sm font-medium">Audio (optional)</label>
+        <input
+          type="file"
+          accept="audio/*"
+          onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+        />
 
-        <div className="rounded-xl border p-3">
-          {recSupported ? (
-            <div className="flex items-center gap-3">
-              {!isRecording ? (
-                <button
-                  type="button"
-                  onClick={startRecording}
-                  className="rounded-lg border px-3 py-1.5"
-                >
-                  Start Recording
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={stopRecording}
-                  className="rounded-lg border px-3 py-1.5"
-                >
-                  Stop ({recordTime}s)
-                </button>
-              )}
-              {audioFile && <div className="text-xs">Recorded: {audioFile.name}</div>}
-            </div>
-          ) : (
-            <div className="text-xs text-gray-600">Recording not supported in this browser.</div>
-          )}
-        </div>
-
-        <div>
-          <input
-            type="file"
-            accept="audio/*"
-            onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
-          />
-          {audioFile && <div className="text-xs mt-1">{audioFile.name}</div>}
-        </div>
+        {recSupported && (
+          <div className="mt-2 flex items-center gap-3">
+            {!isRecording ? (
+              <button
+                type="button"
+                className="rounded-lg border px-3 py-1.5 text-sm"
+                onClick={startRec}
+              >
+                Record
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="rounded-lg border px-3 py-1.5 text-sm"
+                onClick={stopRec}
+              >
+                Stop ({recordTime}s)
+              </button>
+            )}
+            {audioFile ? <span className="text-xs text-gray-600">{audioFile.name}</span> : null}
+          </div>
+        )}
       </div>
 
-      {msg && <div className="text-sm">{msg}</div>}
+      {error ? <div className="text-sm text-red-600">{error}</div> : null}
 
-      <button
-        type="submit"
-        disabled={busy}
-        className="rounded-xl bg-black text-white px-4 py-2 disabled:opacity-50"
-      >
-        {busy ? "Creating…" : "Create Artifact"}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={pending}
+          className="rounded-lg bg-black px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+        >
+          {pending ? "Creating…" : "Create Artifact"}
+        </button>
+      </div>
     </form>
   );
 }
