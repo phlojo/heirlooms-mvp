@@ -102,11 +102,12 @@ export default async function CollectionPage({
             All Collections
           </Link>
           <Link
-            href={`/artifacts/new?collectionId=${encodeURIComponent(col.id)}`}
-            className="rounded-xl bg-black text-white px-3 py-2 text-sm hover:bg-gray-800"
+            href={`/artifacts/new?collectionId=${encodeURIComponent(col.id)}&collection_id=${encodeURIComponent(col.id)}`}
+            className="ml-1 underline"
           >
-            + New Artifact
+            New Artifact
           </Link>
+
         </div>
       </div>
 

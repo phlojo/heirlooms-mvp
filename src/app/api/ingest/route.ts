@@ -16,33 +16,21 @@ async function structureArtifact(input: {
   imageUrls: string[];
   transcript?: string;
 }) {
-  const fallback = {
-    title: input.text?.trim()
-      ? input.text.trim().slice(0, 60)
-      : (input.transcript?.trim()?.slice(0, 60) || "Untitled Artifact"),
-    summary: input.transcript
-      ? "Generated from notes and audio transcript."
-      : "Generated from notes.",
-    media: input.imageUrls.map((u) => ({ type: "image", src: u } as MediaItem)),
-  };
+  const prompt = `
+You are an assistant that structures "artifact" content for a family-archive app.
+Return ONLY JSON with this shape:
 
-  if (!process.env.OPENAI_API_KEY) return fallback;
-
-  try {
-    const prompt = `You are turning notes and (optional) transcript into a concise, elegant catalog entry.
-
-Return strictly this JSON:
 {
-  "title": string,
-  "summary": string,
-  "media": [ {"type":"image","src":string,"alt"?:string} ]
+  "title": "string (<=80 chars)",
+  "summary": "string (1-2 short sentences)",
+  "media": [{"type":"image","src":"<url>","alt":"optional"}...]
 }
 
-Guidelines:
-- Title: 3–7 words, proper case.
-- Summary: 1–3 punchy sentences, no fluff.
-- Media: reference given image URLs with short alt text.
-- If transcript is present, use it to improve summary.
+Rules:
+- Keep the title succinct and human.
+- Include each provided image URL exactly once in "media" with type "image".
+- Do not invent media that wasn't provided.
+- Do not include backticks.
 
 NOTES:
 ${input.text || "(none)"}
@@ -54,68 +42,63 @@ IMAGE_URLS:
 ${input.imageUrls.join("\n")}
 `;
 
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        messages: [
-          { role: "system", content: "Return ONLY valid JSON. Do not include backticks." },
-          { role: "user", content: prompt },
-        ],
-        temperature: 0.2,
-      }),
-    });
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "Return ONLY valid JSON. Do not include backticks." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
+    }),
+  });
 
-    if (!r.ok) throw new Error(await r.text());
-    const j = await r.json();
-    const txt = j?.choices?.[0]?.message?.content;
-    if (!txt || typeof txt !== "string") throw new Error("No JSON returned");
+  if (!r.ok) throw new Error(await r.text());
+  const j = await r.json();
+  const txt = j?.choices?.[0]?.message?.content;
+  if (!txt || typeof txt !== "string") throw new Error("No JSON returned");
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(txt);
-    } catch {
-      const match = txt.match(/\{[\s\S]*\}$/);
-      parsed = match ? JSON.parse(match[0]) : null;
-    }
-    if (!parsed) throw new Error("Invalid JSON from model");
-
-    const Shape = z.object({
-      title: z.string().min(1),
-      summary: z.string().min(1),
-      media: z.array(
-        z.object({
-          type: z.literal("image"),
-          src: z.string().url(),
-          alt: z.string().optional(),
-        })
-      ),
-    });
-
-    const safe = Shape.parse(parsed);
-
-    // Ensure all supplied images appear at least once
-    const existing = new Set(safe.media.map((m) => m.src));
-    const additions = input.imageUrls
-      .filter((u) => !existing.has(u))
-      .map((u) => ({ type: "image" as const, src: u }));
-    return { ...safe, media: [...safe.media, ...additions] };
-  } catch (err) {
-    console.warn("LLM structuring failed; using fallback:", err);
-    return fallback;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(txt);
+  } catch {
+    const match = txt.match(/\{[\s\S]*\}$/);
+    parsed = match ? JSON.parse(match[0]) : null;
   }
+
+  const Shape = z.object({
+    title: z.string().min(1).max(120),
+    summary: z.string().min(1),
+    media: z.array(
+      z.object({
+        type: z.literal("image"),
+        src: z.string().url(),
+        alt: z.string().optional(),
+      })
+    ),
+  });
+
+  const safe = Shape.parse(parsed);
+
+  // Ensure all supplied images appear at least once
+  const existing = new Set(safe.media.map((m) => m.src));
+  const additions = input.imageUrls
+    .filter((u) => !existing.has(u))
+    .map((u) => ({ type: "image" as const, src: u }));
+
+  return { ...safe, media: [...safe.media, ...additions] };
 }
 
-async function transcribeAudio(file: File) {
-  if (!process.env.OPENAI_API_KEY) return undefined;
+async function transcribeAudio(file: File): Promise<string | undefined> {
   try {
     const form = new FormData();
-    form.append("file", file);
-    form.append("model", process.env.OPENAI_WHISPER_MODEL || "whisper-1");
+    form.append("model", "whisper-1");
+    form.append("file", file as any);
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -148,26 +131,48 @@ export async function POST(req: NextRequest) {
 
     if (userErr || !user) {
       return NextResponse.json(
-        { error: "Unauthorized. Please sign in to create artifacts." },
+        { error: "Not authenticated" },
         { status: 401 }
       );
     }
 
-    const formData = await req.formData();
-    const text = String(formData.get("text") || "");
-    const colParam =
-      String(formData.get("collectionId") || formData.get("collection_id") || "")
-        .trim() || null;
+    // Accept data from form-data, JSON, or query
+    const contentType = req.headers.get("content-type") || "";
+    let formData: FormData | null = null;
+    let jsonBody: any = null;
 
-    // Debug logging to help trace incoming values during development
+    if (contentType.includes("multipart/form-data")) {
+      formData = await req.formData();
+    } else if (contentType.includes("application/json")) {
+      jsonBody = await req.json().catch(() => null);
+    }
+
+    const url = new URL(req.url);
+
+    // Normalize inputs
+    const getNorm = (k: string): string | null => {
+      const vForm = formData?.get(k);
+      if (typeof vForm === "string" && vForm.trim()) return vForm.trim();
+      const vJson = jsonBody?.[k];
+      if (typeof vJson === "string" && vJson.trim()) return vJson.trim();
+      const vQuery = url.searchParams.get(k);
+      if (typeof vQuery === "string" && vQuery.trim()) return vQuery.trim();
+      return null;
+    };
+
+    const text = getNorm("text") || "";
+    const colParam =
+      getNorm("collectionId") ||
+      getNorm("collection_id") ||
+      getNorm("collection") ||
+      null;
+
     console.log("INGEST: received colParam:", colParam);
 
-    // Only accept valid UUIDs for the top-level column by default. If the client
-    // supplied a slug (or other string), try to resolve it to a UUID below.
+    // Accept only UUIDs directly; if not UUID, attempt slug → id resolution
     let collectionId: string | null = colParam && uuidRegex.test(colParam) ? colParam : null;
     let ingestWarning: string | null = null;
 
-    // If we got a non-UUID colParam, attempt to resolve it as a collection slug.
     if (!collectionId && colParam) {
       try {
         const { data: found, error: findErr } = await supabase
@@ -177,8 +182,7 @@ export async function POST(req: NextRequest) {
           .limit(1);
 
         if (!findErr && Array.isArray(found) && found.length > 0) {
-          // found[0] shape: { id: string }
-          collectionId = (found[0] as any).id;
+          collectionId = (found[0] as any).id as string;
           console.log("INGEST: resolved slug to collectionId:", collectionId);
         } else {
           ingestWarning = `collectionId provided but not a UUID and no collection found for slug '${colParam}'`;
@@ -189,25 +193,26 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const images = formData.getAll("images") as File[];
-    const audio = (formData.get("audio") as File) || null;
+    // Files
+    const images: File[] = formData ? (formData.getAll("images") as File[]) : [];
+    const audio: File | null = formData ? ((formData.get("audio") as File) || null) : null;
 
-    // 1) Upload images
+    // Upload images
     const uploadedImages: string[] = [];
     for (const img of images) {
       const url = await uploadImageToCloudinary(img);
       uploadedImages.push(url);
     }
 
-    // 2) Upload audio / transcript
-    let audioUrl: string | null = null;
+    // Upload audio + transcribe if present
+    let audioUrl: string | undefined;
     let transcript: string | undefined;
     if (audio) {
       audioUrl = await uploadAudioToCloudinary(audio);
       transcript = await transcribeAudio(audio);
     }
 
-    // 3) Structure
+    // Structure with LLM
     const structured = await structureArtifact({
       text,
       imageUrls: uploadedImages,
@@ -220,9 +225,9 @@ export async function POST(req: NextRequest) {
       ...structured.media,
       ...(audioUrl ? [{ type: "audio" as const, src: audioUrl }] : []),
     ];
-
     const slug = toSlug(title);
 
+    // IMPORTANT: mirror collection both at top-level and inside JSON
     const dataPayload = {
       title,
       summary,
@@ -231,12 +236,11 @@ export async function POST(req: NextRequest) {
       tags: [],
       theme: "museum",
       privacy: "public",
-      collection_id: colParam, // keep original (even if not UUID) in JSON for completeness
-      owner_id: user.id,
       created_at: new Date().toISOString(),
+      ...(collectionId ? { collection_id: collectionId } : {}),
     };
 
-    // Try insert with top-level collection_id (when valid)
+    // Try insert with top-level collection_id too
     const baseRow: Record<string, any> = {
       slug,
       data: dataPayload,
@@ -252,8 +256,8 @@ export async function POST(req: NextRequest) {
       .select("id, slug, collection_id")
       .single();
 
-    // If column is missing (42703), retry without it. (Shouldn't happen now that you have the column.)
-    if (insertErr?.code === "42703" && collectionId) {
+    // If column missing (42703), retry without top-level and rely on JSON mirror
+    if (insertErr?.code === "42703") {
       const { data: inserted2, error: insertErr2 } = await supabase
         .from("artifacts")
         .insert({
@@ -269,8 +273,8 @@ export async function POST(req: NextRequest) {
       if (insertErr2) {
         return NextResponse.json({ error: insertErr2.message }, { status: 500 });
       }
-      // Ensure the inserted object always includes collection_id to match the expected shape.
-      inserted = { ...inserted2!, collection_id: null };
+      // Ensure shape for the rest of the handler
+      inserted = { ...inserted2!, collection_id: null } as any;
       insertErr = null;
     }
 
@@ -278,11 +282,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: insertErr.message }, { status: 500 });
     }
 
-    // If we expected to set a top-level collection_id but the inserted row
-    // doesn't include it, attempt a follow-up update. This can help when the
-    // DB ignored the field during insert (e.g., column wasn't present at insert
-    // time) but is available now. If update fails, we still return the insert
-    // result but include a warning.
+    // If insert returned without collection_id but we resolved one, patch it
     let finalCollectionId = inserted!.collection_id ?? null;
     if (collectionId && !finalCollectionId) {
       try {
@@ -297,24 +297,22 @@ export async function POST(req: NextRequest) {
           finalCollectionId = updated.collection_id ?? finalCollectionId;
           console.log("INGEST: patched artifact with collection_id:", finalCollectionId);
         } else {
-          console.warn("INGEST: failed to patch collection_id:", updErr);
-          ingestWarning = ingestWarning || `inserted but failed to patch collection_id: ${String(updErr?.message || updErr)}`;
+          console.warn("INGEST: failed to patch collection_id; error:", updErr);
+          ingestWarning = ingestWarning || `inserted but failed to patch collection_id: ${updErr?.message || updErr}`;
         }
       } catch (err) {
-        console.warn("INGEST: patch attempt failed:", err);
-        ingestWarning = ingestWarning || `inserted but patch attempt failed: ${String(err)}`;
+        console.warn("INGEST: exception patching collection_id:", err);
+        ingestWarning = ingestWarning || `inserted but failed to patch collection_id (exception).`;
       }
     }
 
-    // Return helpful debug/warning fields so the client can surface them during testing.
     const respBody: Record<string, any> = {
       id: inserted!.id,
       slug: inserted!.slug,
       collection_id: finalCollectionId ?? collectionId ?? null,
+      received_collection_param: colParam,
     };
     if (ingestWarning) respBody.warning = ingestWarning;
-    // include original param for debugging
-    respBody.received_collection_param = colParam;
 
     return NextResponse.json(respBody, { status: 200 });
   } catch (err: any) {

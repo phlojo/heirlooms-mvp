@@ -10,15 +10,23 @@ export const dynamic = "force-dynamic";
 
 export default function NewArtifactPage({ searchParams }: PageProps) {
   const collectionId =
-    typeof searchParams?.collectionId === "string" ? searchParams.collectionId : null;
+    typeof searchParams?.collectionId === "string"
+      ? searchParams.collectionId
+      : typeof searchParams?.collection_id === "string"
+      ? searchParams.collection_id
+      : null;
 
   return (
     <main className="max-w-3xl mx-auto p-6 space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="space-y-2">
         <h1 className="text-2xl font-semibold">Create Artifact</h1>
-        <div className="flex gap-2">
+        <p className="text-sm text-gray-600">
+          Add images, optional audio, and notes. We’ll generate a concise title and summary.
+        </p>
+
+        <div className="flex items-center gap-3">
           <Link href="/collections" className="text-sm underline">
-            Collections
+            All Collections
           </Link>
           {collectionId && (
             <Link
