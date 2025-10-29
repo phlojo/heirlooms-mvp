@@ -1,17 +1,16 @@
 // src/app/api/ingest/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-
-// Imports (switch to relative if you don't have the "@/src" alias)
 import { getSupabaseServer } from "@/src/lib/supabase/server";
 import { uploadImageToCloudinary, uploadAudioToCloudinary } from "@/src/lib/upload";
 
 export const runtime = "nodejs";
 
-// ----- Local types -----
 type MediaItem = { type: "image" | "audio"; src: string; alt?: string };
 
-// ----- Helpers -----
+const uuidRegex =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 async function structureArtifact(input: {
   text: string;
   imageUrls: string[];
@@ -113,12 +112,10 @@ ${input.imageUrls.join("\n")}
 
 async function transcribeAudio(file: File) {
   if (!process.env.OPENAI_API_KEY) return undefined;
-
   try {
     const form = new FormData();
     form.append("file", file);
     form.append("model", process.env.OPENAI_WHISPER_MODEL || "whisper-1");
-
     const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -143,15 +140,11 @@ function toSlug(s: string) {
   return base;
 }
 
-// ----- Route -----
 export async function POST(req: NextRequest) {
   try {
-    // Auth: require a logged-in user because artifacts.owner_id is NOT NULL
     const supabase = await getSupabaseServer();
-    const {
-      data: { user },
-      error: userErr,
-    } = await supabase.auth.getUser();
+    const { data: authData, error: userErr } = await supabase.auth.getUser();
+    const user = authData?.user;
 
     if (userErr || !user) {
       return NextResponse.json(
@@ -162,7 +155,13 @@ export async function POST(req: NextRequest) {
 
     const formData = await req.formData();
     const text = String(formData.get("text") || "");
-    const collectionId = String(formData.get("collectionId") || "").trim() || null;
+    const colParam =
+      String(formData.get("collectionId") || formData.get("collection_id") || "")
+        .trim() || null;
+
+    // Only accept valid UUIDs for the top-level column. (JSON can keep whatever string.)
+    const collectionId = colParam && uuidRegex.test(colParam) ? colParam : null;
+
     const images = formData.getAll("images") as File[];
     const audio = (formData.get("audio") as File) || null;
 
@@ -173,7 +172,7 @@ export async function POST(req: NextRequest) {
       uploadedImages.push(url);
     }
 
-    // 2) Upload audio (+ transcript)
+    // 2) Upload audio / transcript
     let audioUrl: string | null = null;
     let transcript: string | undefined;
     if (audio) {
@@ -195,10 +194,9 @@ export async function POST(req: NextRequest) {
       ...(audioUrl ? [{ type: "audio" as const, src: audioUrl }] : []),
     ];
 
-    // 4) Build record payload
     const slug = toSlug(title);
+
     const dataPayload = {
-      id: crypto.randomUUID(),
       title,
       summary,
       media,
@@ -206,45 +204,57 @@ export async function POST(req: NextRequest) {
       tags: [],
       theme: "museum",
       privacy: "public",
-      collection_id: collectionId, // also inside JSON
-      owner_id: user.id,           // also inside JSON
+      collection_id: colParam, // keep original (even if not UUID) in JSON for completeness
+      owner_id: user.id,
       created_at: new Date().toISOString(),
     };
 
-    // 5) Insert with graceful fallbacks if some columns don't exist
-    const fullRow: Record<string, any> = {
+    // Try insert with top-level collection_id (when valid)
+    const baseRow: Record<string, any> = {
       slug,
       data: dataPayload,
       title,
       summary,
       owner_id: user.id,
-      collection_id: collectionId,
+      ...(collectionId ? { collection_id: collectionId } : {}),
     };
 
-    async function tryInsert(row: Record<string, any>) {
-      const { error } = await supabase.from("artifacts").insert(row);
-      return error;
+    let { data: inserted, error: insertErr } = await supabase
+      .from("artifacts")
+      .insert(baseRow)
+      .select("id, slug, collection_id")
+      .single();
+
+    // If column is missing (42703), retry without it. (Shouldn't happen now that you have the column.)
+    if (insertErr?.code === "42703" && collectionId) {
+      const { data: inserted2, error: insertErr2 } = await supabase
+        .from("artifacts")
+        .insert({
+          slug,
+          data: dataPayload,
+          title,
+          summary,
+          owner_id: user.id,
+        })
+        .select("id, slug")
+        .single();
+
+      if (insertErr2) {
+        return NextResponse.json({ error: insertErr2.message }, { status: 500 });
+      }
+      // Ensure the inserted object always includes collection_id to match the expected shape.
+      inserted = { ...inserted2!, collection_id: null };
+      insertErr = null;
     }
 
-    // Attempt 1: All columns
-    let err = await tryInsert(fullRow);
-
-    // If a column doesn't exist (42703), strip progressively
-    if (err?.code === "42703") {
-      const { collection_id, ...noCollection } = fullRow;
-      err = await tryInsert(noCollection);
-    }
-    if (err?.code === "42703") {
-      const { title: _t, summary: _s, ...noTitleSummary } = fullRow;
-      err = await tryInsert(noTitleSummary);
+    if (insertErr) {
+      return NextResponse.json({ error: insertErr.message }, { status: 500 });
     }
 
-    // Surface any remaining error (e.g., other NOT NULL constraints)
-    if (err) {
-      return NextResponse.json({ error: err.message }, { status: 500 });
-    }
-
-    return NextResponse.json({ slug }, { status: 200 });
+    return NextResponse.json(
+      { id: inserted!.id, slug: inserted!.slug, collection_id: inserted!.collection_id ?? collectionId ?? null },
+      { status: 200 }
+    );
   } catch (err: any) {
     console.error("INGEST ERROR:", err);
     return NextResponse.json({ error: err?.message || String(err) }, { status: 500 });
