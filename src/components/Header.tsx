@@ -7,7 +7,7 @@ export default function Header() {
     <header className="sticky top-0 z-30 w-full border-b bg-teal-500/70 backdrop-blur">
       <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
         <Link href="/" className="text-base font-semibold">
-          Heirlooms.ai
+          Heirlooms.ai APP
         </Link>
         <nav className="flex items-center gap-3">
           <Link
