@@ -278,10 +278,45 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: insertErr.message }, { status: 500 });
     }
 
-    return NextResponse.json(
-      { id: inserted!.id, slug: inserted!.slug, collection_id: inserted!.collection_id ?? collectionId ?? null },
-      { status: 200 }
-    );
+    // If we expected to set a top-level collection_id but the inserted row
+    // doesn't include it, attempt a follow-up update. This can help when the
+    // DB ignored the field during insert (e.g., column wasn't present at insert
+    // time) but is available now. If update fails, we still return the insert
+    // result but include a warning.
+    let finalCollectionId = inserted!.collection_id ?? null;
+    if (collectionId && !finalCollectionId) {
+      try {
+        const { data: updated, error: updErr } = await supabase
+          .from("artifacts")
+          .update({ collection_id: collectionId })
+          .eq("id", inserted!.id)
+          .select("collection_id")
+          .single();
+
+        if (!updErr && updated) {
+          finalCollectionId = updated.collection_id ?? finalCollectionId;
+          console.log("INGEST: patched artifact with collection_id:", finalCollectionId);
+        } else {
+          console.warn("INGEST: failed to patch collection_id:", updErr);
+          ingestWarning = ingestWarning || `inserted but failed to patch collection_id: ${String(updErr?.message || updErr)}`;
+        }
+      } catch (err) {
+        console.warn("INGEST: patch attempt failed:", err);
+        ingestWarning = ingestWarning || `inserted but patch attempt failed: ${String(err)}`;
+      }
+    }
+
+    // Return helpful debug/warning fields so the client can surface them during testing.
+    const respBody: Record<string, any> = {
+      id: inserted!.id,
+      slug: inserted!.slug,
+      collection_id: finalCollectionId ?? collectionId ?? null,
+    };
+    if (ingestWarning) respBody.warning = ingestWarning;
+    // include original param for debugging
+    respBody.received_collection_param = colParam;
+
+    return NextResponse.json(respBody, { status: 200 });
   } catch (err: any) {
     console.error("INGEST ERROR:", err);
     return NextResponse.json({ error: err?.message || String(err) }, { status: 500 });
