@@ -1,16 +1,24 @@
 // src/app/login/page.tsx
 "use client";
 
-import { useState } from "react";
+import { useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { getSupabaseBrowser } from "@/src/lib/supabase/client";
 
+function SearchParamsComponent({ onParams }: { onParams: (params: URLSearchParams) => void }) {
+  const searchParams = useSearchParams();
+  onParams(searchParams);
+  return null;
+}
+
 export default function LoginPage() {
   const router = useRouter();
-  const qs = useSearchParams();
+  const [redirect, setRedirect] = useState("/");
   const supabase = getSupabaseBrowser();
 
-  const redirect = qs.get("redirect") || "/";
+  const handleSearchParams = (params: URLSearchParams) => {
+    setRedirect(params.get("redirect") || "/");
+  };
 
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
@@ -60,6 +68,9 @@ export default function LoginPage() {
 
   return (
     <main className="max-w-md mx-auto p-6 space-y-6">
+      <Suspense>
+        <SearchParamsComponent onParams={handleSearchParams} />
+      </Suspense>
       <h1 className="text-2xl font-semibold">Sign in</h1>
 
       <button
