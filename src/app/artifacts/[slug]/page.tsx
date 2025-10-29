@@ -1,4 +1,4 @@
-// src/app/artifact/[slug]/page.tsx
+// src/app/artifacts/[slug]/page.tsx
 import Link from "next/link";
 import { getSupabaseServer } from "@/src/lib/supabase/server";
 import { notFound } from "next/navigation";

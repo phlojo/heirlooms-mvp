@@ -122,8 +122,8 @@ export default function NewArtifactForm({ initialCollectionId }: Props) {
       const id = j?.id as string | undefined;
 
       // Prefer your canonical route; adjust if your app uses /artifacts/:slug instead.
-      if (slug) router.push(`/artifact/${encodeURIComponent(slug)}`);
-      else if (id) router.push(`/artifact/${encodeURIComponent(id)}`);
+      if (slug) router.push(`/artifacts/${encodeURIComponent(slug)}`);
+      else if (id) router.push(`/artifacts/${encodeURIComponent(id)}`);
       else router.push("/collections");
     } catch (err: any) {
       setMsg(`❌ ${err?.message || String(err)}`);
