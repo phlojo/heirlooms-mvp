@@ -4,43 +4,7 @@ import { cookies } from "next/headers";
 import { createServerClient, type CookieOptions } from "@supabase/ssr";
 
 export const runtime = "nodejs";
-
-// sanitize "john.smith+foo" -> "john.smith", then keep a-z0-9._-
-function emailLocalPart(email?: string | null) {
-  if (!email) return null;
-  const local = email.split("@")[0] || "";
-  return local.replace(/\+.*/, ""); // drop +tag
-}
-function sanitizeUsername(s: string) {
-  const cleaned = s.toLowerCase().replace(/[^a-z0-9._-]+/g, "");
-  // ensure not empty
-  return cleaned || `user_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-async function ensureUniqueUsername(
-  supabase: ReturnType<typeof createServerClient>,
-  base: string,
-  selfId: string
-): Promise<string> {
-  let candidate = sanitizeUsername(base);
-  // check collisions
-  let suffix = 0;
-  // try up to 10 variants (very unlikely to need many)
-  for (let i = 0; i < 10; i++) {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id")
-      .eq("username", candidate)
-      .neq("id", selfId)
-      .limit(1)
-      .maybeSingle();
-    if (!error && !data) return candidate;
-    suffix++;
-    candidate = `${candidate}-${suffix}`;
-  }
-  // last resort
-  return `${candidate}-${Math.random().toString(36).slice(2, 4)}`;
-}
+export const dynamic = "force-dynamic";
 
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
@@ -67,48 +31,28 @@ export async function GET(req: NextRequest) {
     }
   );
 
-  if (code) {
-    // 1) Establish session
-    await supabase.auth.exchangeCodeForSession(code);
-    // 2) Upsert profile
-    const { data: userData } = await supabase.auth.getUser();
-    const user = userData?.user;
+  try {
+    if (!code) {
+      // No code means Google didn't redirect correctly or wrong URL
+      console.error("[auth/callback] Missing ?code");
+      return NextResponse.redirect(new URL(`${redirect}?auth_error=missing_code`, req.url));
+    }
 
-    if (user) {
-      const rawName =
-        (user.user_metadata?.name as string | undefined) ||
-        (user.user_metadata?.full_name as string | undefined) ||
-        undefined;
-
-      const rawAvatar =
-        (user.user_metadata?.avatar_url as string | undefined) || undefined;
-
-      const email = user.email || undefined;
-
-      // derive username: prefer explicit metadata.username if present, else from email local-part, else from name
-      let desiredBase =
-        (user.user_metadata?.username as string | undefined) ||
-        emailLocalPart(email) ||
-        (rawName ? rawName.replace(/\s+/g, ".") : undefined) ||
-        `user_${user.id.slice(0, 6)}`;
-
-      // ensure sanitized & unique
-      const username = await ensureUniqueUsername(supabase, desiredBase, user.id);
-
-      // upsert profile
-      await supabase.from("profiles").upsert(
-        {
-          id: user.id,
-          username,
-          display_name: rawName || null,
-          full_name: rawName || null,
-          email: email || null,
-          avatar_url: rawAvatar || null,
-        },
-        { onConflict: "id" }
+    // 1) Exchange the code for a session (sets the auth cookies)
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+    if (error) {
+      console.error("[auth/callback] exchangeCodeForSession error:", error.message);
+      return NextResponse.redirect(
+        new URL(`${redirect}?auth_error=exchange_failed`, req.url)
       );
     }
-  }
 
-  return NextResponse.redirect(new URL(redirect, req.url));
+    // (Optional) You can upsert a profile here; keep it out for now to reduce failure points.
+
+    // 2) Redirect back
+    return NextResponse.redirect(new URL(redirect, req.url));
+  } catch (e: any) {
+    console.error("[auth/callback] unexpected error:", e?.message || e);
+    return NextResponse.redirect(new URL(`${redirect}?auth_error=unexpected`, req.url));
+  }
 }
